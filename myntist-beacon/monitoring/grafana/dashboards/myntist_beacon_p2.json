@@ -1,0 +1,229 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": {
+    "list": []
+  },
+  "description": "Myntist Sovereign Beacon — Phase 2 Financial Telemetry",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Float Yield (‰/day)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "$DS_PROMETHEUS" },
+          "expr": "beacon_float_yield * 1000",
+          "legendFormat": "Float Yield ‰/day"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 7 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "single", "sort": "none" }
+      }
+    },
+    {
+      "id": 2,
+      "title": "r_HSCE Intelligence Rate (/day)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "$DS_PROMETHEUS" },
+          "expr": "beacon_r_hsce",
+          "legendFormat": "r_HSCE"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "orange", "value": null },
+              { "color": "green", "value": 0.005 },
+              { "color": "orange", "value": 0.03 }
+            ]
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "title": "Liquidity Signal D",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "$DS_PROMETHEUS" },
+          "expr": "beacon_liquidity_signal",
+          "legendFormat": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0.10 }
+            ]
+          },
+          "unit": "short",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "title": "Coherence Signal Ttau",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 9, "x": 6, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "$DS_PROMETHEUS" },
+          "expr": "beacon_coherence_signal",
+          "legendFormat": "Ttau"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.25 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "alert": {
+        "name": "Ttau Sustained Breach",
+        "conditions": [
+          {
+            "evaluator": { "params": [0.25], "type": "gt" },
+            "operator": { "type": "and" },
+            "query": { "params": ["A", "5m", "now"] },
+            "reducer": { "params": [], "type": "avg" },
+            "type": "query"
+          }
+        ],
+        "executionErrorState": "alerting",
+        "for": "5m",
+        "frequency": "1m",
+        "handler": 1,
+        "message": "Ttau coherence signal has breached 0.25 threshold — P002 may throttle IAM events",
+        "noDataState": "no_data",
+        "notifications": []
+      }
+    },
+    {
+      "id": 5,
+      "title": "Reinvestment Rate & Policy Gate",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 9, "x": 15, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "$DS_PROMETHEUS" },
+          "expr": "beacon_float_reinvestment_rate * 100",
+          "legendFormat": "Reinvestment Rate %"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "$DS_PROMETHEUS" },
+          "expr": "beacon_policy_admitted",
+          "legendFormat": "Admitted"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 50 }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "alert": {
+        "name": "Low Survivability Block",
+        "conditions": [
+          {
+            "evaluator": { "params": [0.5], "type": "lt" },
+            "operator": { "type": "and" },
+            "query": { "params": ["B", "1m", "now"] },
+            "reducer": { "params": [], "type": "last" },
+            "type": "query"
+          }
+        ],
+        "executionErrorState": "alerting",
+        "for": "1m",
+        "frequency": "30s",
+        "handler": 1,
+        "message": "P003: Survivability S has fallen below 0.50 — all IAM events blocked",
+        "noDataState": "no_data",
+        "notifications": []
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["myntist", "beacon", "phase2", "financial"],
+  "templating": { "list": [] },
+  "time": { "from": "now-24h", "to": "now" },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "Myntist Sovereign Beacon — Phase 2",
+  "uid": "myntist-beacon-p2",
+  "version": 1,
+  "alerts": [
+    {
+      "name": "Low Liquidity D Alert",
+      "conditions": [
+        {
+          "evaluator": { "params": [0.10], "type": "lt" },
+          "query": { "params": ["A"] },
+          "reducer": { "type": "last" },
+          "type": "query"
+        }
+      ],
+      "for": "2m",
+      "message": "P001: Liquidity signal D has fallen below 0.10 — token_issued events will be blocked",
+      "noDataState": "no_data"
+    }
+  ]
+}

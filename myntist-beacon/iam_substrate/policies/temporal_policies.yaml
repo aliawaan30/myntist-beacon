@@ -1,0 +1,69 @@
+---
+# Temporal IAM Policies — Phase 2
+#
+# Evaluated by policy_engine.py using safe AST comparisons only.
+# Most severe policy wins when multiple policies activate simultaneously.
+# Severity order (highest first): block > refuse > throttle_high > throttle_low
+#
+# Fields available in field_state context:
+#   S, delta_S, Q, tau, nabla_phi, field_state
+#   D (liquidity_signal), Ttau (coherence_signal)
+
+policies:
+
+  - id: P001
+    name: "Low Liquidity Token Block"
+    description: >
+      Block token_issued events when liquidity signal D is below 0.10.
+      Low liquidity indicates insufficient field coherence to authorise new tokens.
+    action: block
+    applies_to: [token_issued]
+    condition:
+      field: D
+      op: lt
+      threshold: 0.10
+    throttle_rate: null
+    enabled: true
+
+  - id: P002
+    name: "Ttau Sustained Breach Throttle"
+    description: >
+      Throttle all events at 0.50 when coherence signal Ttau exceeds 0.25
+      for 3 or more consecutive evaluation cycles. Resets when Ttau falls below 0.25.
+    action: throttle
+    applies_to: ["*"]
+    condition:
+      field: Ttau
+      op: gt
+      threshold: 0.25
+      consecutive_breaches_required: 3
+    throttle_rate: 0.50
+    enabled: true
+
+  - id: P003
+    name: "Critical Survivability Block"
+    description: >
+      Block all events when survivability score S falls below 0.50.
+      S < 0.50 indicates a severe field incident requiring manual review.
+    action: block
+    applies_to: ["*"]
+    condition:
+      field: S
+      op: lt
+      threshold: 0.50
+    throttle_rate: null
+    enabled: true
+
+  - id: P004
+    name: "Excitation State Throttle"
+    description: >
+      Throttle all events at 0.75 when the field is in excitation state (0.70 <= S < 0.85).
+      Reduces token pressure during field excitation to stabilise the substrate.
+    action: throttle
+    applies_to: ["*"]
+    condition:
+      field: field_state
+      op: eq
+      value: excitation
+    throttle_rate: 0.75
+    enabled: true

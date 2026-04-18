@@ -1,0 +1,480 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Myntist Sovereign Beacon — ECS Fargate (self-contained VPC + ALB + 3 services)
+
+Parameters:
+  ImageTagApi:
+    Type: String
+    Default: latest
+  ImageTagExpress:
+    Type: String
+    Default: latest
+  ImageTagDashboard:
+    Type: String
+    Default: latest
+  DatabaseUrl:
+    Type: String
+    NoEcho: true
+    Default: "postgresql://myntist:changeme@localhost/myntist"
+  Ed25519PrivateKeyHex:
+    Type: String
+    NoEcho: true
+    Default: ""
+  GodaddyApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+  GodaddyApiSecret:
+    Type: String
+    NoEcho: true
+    Default: ""
+  GodaddyDomain:
+    Type: String
+    Default: myntist.com
+  StagingSigningKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+
+Resources:
+
+  # ── VPC ───────────────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.10.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: myntist-beacon-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: myntist-beacon-igw
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Two public subnets across two AZs (ALB requires >= 2)
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: myntist-beacon-subnet-a
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: myntist-beacon-subnet-b
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: myntist-beacon-rtb
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ── Security Groups ───────────────────────────────────────────────────────
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB inbound HTTP/HTTPS
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  ServiceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks — allow all from ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref AlbSG
+        - IpProtocol: tcp
+          FromPort: 3001
+          ToPort: 3001
+          SourceSecurityGroupId: !Ref AlbSG
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSG
+
+  # ── IAM Role for ECS task execution ──────────────────────────────────────
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: myntist-ecs-task-execution
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: myntist-beacon-task-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/myntist/beacon/*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # ── CloudWatch Log Group ──────────────────────────────────────────────────
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /myntist/beacon
+      RetentionInDays: 14
+
+  # ── ECS Cluster ───────────────────────────────────────────────────────────
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: myntist-beacon
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  # ── ALB ───────────────────────────────────────────────────────────────────
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: myntist-beacon-alb
+      Subnets:
+        - !Ref SubnetA
+        - !Ref SubnetB
+      SecurityGroups: [!Ref AlbSG]
+      Scheme: internet-facing
+      Type: application
+
+  TGApi:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: myntist-beacon-api
+      Port: 8000
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  TGExpress:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: myntist-beacon-express
+      Port: 3001
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  TGDashboard:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: myntist-beacon-dashboard
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TGDashboard
+
+  ListenerRuleApiField:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values: ["/api/field/*"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGApi
+
+  ListenerRuleWellKnown:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 15
+      Conditions:
+        - Field: path-pattern
+          Values: ["/.well-known/*"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGApi
+
+  ListenerRuleApi:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          Values: ["/api/*"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGApi
+
+  # ── Task Definitions ──────────────────────────────────────────────────────
+  TaskDefApi:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: LogGroup
+    Properties:
+      Family: myntist-beacon-api
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/myntist-beacon-api:${ImageTagApi}"
+          PortMappings:
+            - ContainerPort: 8000
+          Environment:
+            - Name: GODADDY_DOMAIN
+              Value: !Ref GodaddyDomain
+            - Name: DATABASE_URL
+              Value: !Ref DatabaseUrl
+            - Name: ED25519_PRIVATE_KEY_HEX
+              Value: !Ref Ed25519PrivateKeyHex
+            - Name: GODADDY_API_KEY
+              Value: !Ref GodaddyApiKey
+            - Name: GODADDY_API_SECRET
+              Value: !Ref GodaddyApiSecret
+            - Name: STAGING_SIGNING_KEY
+              Value: !Ref StagingSigningKey
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /myntist/beacon
+              awslogs-region: us-east-1
+              awslogs-stream-prefix: api
+              awslogs-create-group: "true"
+
+  TaskDefExpress:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: LogGroup
+    Properties:
+      Family: myntist-beacon-express
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: express
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/myntist-beacon-express:${ImageTagExpress}"
+          PortMappings:
+            - ContainerPort: 3001
+          Environment:
+            - Name: PORT
+              Value: "3001"
+            - Name: NODE_ENV
+              Value: production
+            - Name: BEACON_API_URL
+              Value: http://localhost:8000
+            - Name: DATABASE_URL
+              Value: !Ref DatabaseUrl
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /myntist/beacon
+              awslogs-region: us-east-1
+              awslogs-stream-prefix: express
+              awslogs-create-group: "true"
+
+  TaskDefDashboard:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: LogGroup
+    Properties:
+      Family: myntist-beacon-dashboard
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: dashboard
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/myntist-beacon-dashboard:${ImageTagDashboard}"
+          PortMappings:
+            - ContainerPort: 80
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /myntist/beacon
+              awslogs-region: us-east-1
+              awslogs-stream-prefix: dashboard
+              awslogs-create-group: "true"
+
+  # ── ECS Services ──────────────────────────────────────────────────────────
+  ServiceApi:
+    Type: AWS::ECS::Service
+    DependsOn: ListenerRuleApi
+    Properties:
+      ServiceName: myntist-beacon-api
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefApi
+      LaunchType: FARGATE
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref SubnetA
+            - !Ref SubnetB
+          SecurityGroups: [!Ref ServiceSG]
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 8000
+          TargetGroupArn: !Ref TGApi
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+
+  ServiceExpress:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      ServiceName: myntist-beacon-express
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefExpress
+      LaunchType: FARGATE
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref SubnetA
+            - !Ref SubnetB
+          SecurityGroups: [!Ref ServiceSG]
+      HealthCheckGracePeriodSeconds: 60
+
+  ServiceDashboard:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      ServiceName: myntist-beacon-dashboard
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefDashboard
+      LaunchType: FARGATE
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref SubnetA
+            - !Ref SubnetB
+          SecurityGroups: [!Ref ServiceSG]
+      LoadBalancers:
+        - ContainerName: dashboard
+          ContainerPort: 80
+          TargetGroupArn: !Ref TGDashboard
+      HealthCheckGracePeriodSeconds: 30
+
+Outputs:
+  LoadBalancerDns:
+    Description: Public URL of the Myntist Sovereign Beacon
+    Value: !Sub "http://${ALB.DNSName}"
+    Export:
+      Name: myntist-beacon-url
+
+  DashboardUrl:
+    Value: !Sub "http://${ALB.DNSName}/"
+
+  ApiUrl:
+    Value: !Sub "http://${ALB.DNSName}/api/field/v1/status.json"
+
+  WellKnownUrl:
+    Value: !Sub "http://${ALB.DNSName}/.well-known/field-signing-keys.json"
+
+  VpcId:
+    Description: VPC created for Myntist Beacon
+    Value: !Ref VPC
+
+  SubnetIds:
+    Description: Public subnets
+    Value: !Join [",", [!Ref SubnetA, !Ref SubnetB]]

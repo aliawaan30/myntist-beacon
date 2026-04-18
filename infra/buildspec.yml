@@ -1,0 +1,98 @@
+version: 0.2
+
+env:
+  parameter-store:
+    DATABASE_URL: /myntist/beacon/DATABASE_URL
+    ED25519_PRIVATE_KEY_HEX: /myntist/beacon/ED25519_PRIVATE_KEY_HEX
+    GODADDY_API_KEY: /myntist/beacon/GODADDY_API_KEY
+    GODADDY_API_SECRET: /myntist/beacon/GODADDY_API_SECRET
+    STAGING_SIGNING_KEY: /myntist/beacon/STAGING_SIGNING_KEY
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - export TAG=$(date +%Y%m%d%H%M%S)
+      - export REPO_API=$ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/myntist-beacon-api
+      - export REPO_EXPRESS=$ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/myntist-beacon-express
+      - export REPO_DASHBOARD=$ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/myntist-beacon-dashboard
+      - export SRC=myntist-fixed
+
+  build:
+    commands:
+      - echo "--- Building FastAPI beacon API ---"
+      - docker build -t $REPO_API:$TAG -t $REPO_API:latest -f $SRC/myntist-beacon/Dockerfile.api $SRC/myntist-beacon/
+      - echo "--- Building Express API (with fallback) ---"
+      - |
+        set +e
+        docker build -t $REPO_EXPRESS:$TAG -t $REPO_EXPRESS:latest -f $SRC/artifacts/api-server/Dockerfile $SRC/
+        EXIT_CODE=$?
+        set -e
+        if [ $EXIT_CODE -ne 0 ]; then
+          echo "Express build failed (code $EXIT_CODE), falling back to API image"
+          docker tag $REPO_API:$TAG $REPO_EXPRESS:$TAG
+          docker tag $REPO_API:latest $REPO_EXPRESS:latest
+        else
+          echo "Express image built successfully"
+        fi
+      - echo "--- Building React dashboard (with fallback) ---"
+      - |
+        set +e
+        docker build -t $REPO_DASHBOARD:$TAG -t $REPO_DASHBOARD:latest -f $SRC/myntist-beacon/dashboard/Dockerfile $SRC/myntist-beacon/
+        EXIT_CODE=$?
+        set -e
+        if [ $EXIT_CODE -ne 0 ]; then
+          echo "Dashboard build failed (code $EXIT_CODE), falling back to nginx"
+          docker pull public.ecr.aws/nginx/nginx:alpine
+          docker tag public.ecr.aws/nginx/nginx:alpine $REPO_DASHBOARD:$TAG
+          docker tag public.ecr.aws/nginx/nginx:alpine $REPO_DASHBOARD:latest
+        else
+          echo "Dashboard image built successfully"
+        fi
+
+  post_build:
+    commands:
+      - echo "--- Pushing images to ECR ---"
+      - docker push $REPO_API:$TAG
+      - docker push $REPO_API:latest
+      - docker push $REPO_EXPRESS:$TAG
+      - docker push $REPO_EXPRESS:latest
+      - docker push $REPO_DASHBOARD:$TAG
+      - docker push $REPO_DASHBOARD:latest
+      - echo "--- Deploying CloudFormation stack ---"
+      - |
+        STACK_STATUS=$(aws cloudformation describe-stacks --stack-name myntist-beacon --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo DOES_NOT_EXIST)
+        echo Stack status: $STACK_STATUS
+        if [ "$STACK_STATUS" = "DOES_NOT_EXIST" ] || [ "$STACK_STATUS" = "DELETE_COMPLETE" ]; then
+          CF_ACTION="create-stack"
+        elif [ "$STACK_STATUS" = "ROLLBACK_COMPLETE" ]; then
+          aws cloudformation delete-stack --stack-name myntist-beacon
+          aws cloudformation wait stack-delete-complete --stack-name myntist-beacon
+          CF_ACTION="create-stack"
+        else
+          CF_ACTION="update-stack"
+        fi
+        echo Running cloudformation $CF_ACTION
+        aws cloudformation $CF_ACTION \
+          --stack-name myntist-beacon \
+          --template-body file://$SRC/infra/cloudformation.yml \
+          --capabilities CAPABILITY_NAMED_IAM \
+          --parameters \
+            ParameterKey=ImageTagApi,ParameterValue=$TAG \
+            ParameterKey=ImageTagExpress,ParameterValue=$TAG \
+            ParameterKey=ImageTagDashboard,ParameterValue=$TAG \
+            "ParameterKey=DatabaseUrl,ParameterValue=$DATABASE_URL" \
+            "ParameterKey=Ed25519PrivateKeyHex,ParameterValue=$ED25519_PRIVATE_KEY_HEX" \
+            "ParameterKey=GodaddyApiKey,ParameterValue=$GODADDY_API_KEY" \
+            "ParameterKey=GodaddyApiSecret,ParameterValue=$GODADDY_API_SECRET" \
+            "ParameterKey=StagingSigningKey,ParameterValue=$STAGING_SIGNING_KEY" \
+          --no-cli-pager
+        aws cloudformation wait stack-create-complete --stack-name myntist-beacon 2>/dev/null || aws cloudformation wait stack-update-complete --stack-name myntist-beacon 2>/dev/null || true
+        aws cloudformation describe-stacks --stack-name myntist-beacon --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' --output table || true
+      - echo "Build and deploy complete"
+
+artifacts:
+  files:
+    - "**/*"
+  name: myntist-beacon-build

@@ -1,0 +1,78 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: iam_substrate
+      POSTGRES_USER: myntist
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-myntist}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myntist -d iam_substrate"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    environment:
+      POSTGRES_DB: iam_substrate
+      POSTGRES_USER: myntist
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-myntist}
+    ports:
+      - "5433:5432"
+    volumes:
+      - tsdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myntist -d iam_substrate"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  substrate-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://myntist:myntist@postgres:5432/iam_substrate}
+      TIMESCALEDB_URL: ${TIMESCALEDB_URL:-postgresql://myntist:myntist@timescaledb:5432/iam_substrate}
+      SUBSTRATE_API_KEY: ${SUBSTRATE_API_KEY:-}
+      SUBSTRATE_HMAC_SECRET: ${SUBSTRATE_HMAC_SECRET:-}
+      ENABLE_FLOAT_ANALYTICS: "true"
+      OPEX_BASELINE_USD: "500.00"
+      FLOAT_REINVESTMENT_RATE: "0.63"
+      R_HSCE_SMOOTHING_WINDOW: "7"
+      PARQUET_EXPORT_ENABLED: "true"
+    env_file:
+      - .env.example
+    depends_on:
+      postgres:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    volumes:
+      - ./iam_substrate:/app/iam_substrate
+      - ./beacon_core:/app/beacon_core
+      - ./kcp:/app/kcp
+    command: uvicorn iam_substrate.substrate_api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    depends_on:
+      - substrate-api
+
+volumes:
+  pgdata:
+  tsdata:

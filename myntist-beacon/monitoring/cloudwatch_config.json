@@ -1,0 +1,37 @@
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "run_as_user": "root"
+  },
+  "metrics": {
+    "namespace": "MyntistBeacon",
+    "metrics_collected": {
+      "cpu": {
+        "measurement": ["cpu_usage_idle", "cpu_usage_user", "cpu_usage_system"],
+        "metrics_collection_interval": 60
+      },
+      "mem": {
+        "measurement": ["mem_used_percent"],
+        "metrics_collection_interval": 60
+      },
+      "disk": {
+        "measurement": ["used_percent"],
+        "metrics_collection_interval": 300
+      }
+    }
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/substrate-api/*.log",
+            "log_group_name": "/myntist/beacon/substrate-api",
+            "log_stream_name": "{instance_id}",
+            "timestamp_format": "%Y-%m-%dT%H:%M:%S"
+          }
+        ]
+      }
+    }
+  }
+}

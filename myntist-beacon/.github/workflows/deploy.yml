@@ -1,0 +1,267 @@
+name: Deploy Beacon
+
+on:
+  push:
+    branches:
+      - main
+
+# ---------------------------------------------------------------------------
+# AWS credentials:
+#   Option A (recommended) — OIDC (no long-lived keys):
+#     Add a GitHub OIDC identity provider in your AWS account, create an IAM
+#     role with the trust policy, and set secrets.AWS_ROLE_ARN.
+#     Then replace the configure-aws-credentials step with:
+#       role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+#       role-session-name: github-deploy
+#
+#   Option B — IAM user access keys:
+#     Set repository secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   AWS_ACCESS_KEY_ID          IAM user key id (Option B)
+#   AWS_SECRET_ACCESS_KEY      IAM user secret (Option B)
+#   AWS_ACCOUNT_ID             12-digit AWS account ID
+#   DATABASE_URL               PostgreSQL connection string (pushed to SSM)
+#   ED25519_PRIVATE_KEY_HEX    Hex-encoded 32-byte Ed25519 private key
+#   GODADDY_API_KEY            GoDaddy API key (optional)
+#   GODADDY_API_SECRET         GoDaddy API secret (optional)
+#
+# Required repository variables (Settings → Secrets and variables → Variables):
+#   AWS_REGION                 e.g. us-east-1 (defaults to us-east-1 if absent)
+#   ECS_CLUSTER                ECS cluster name (default: myntist-beacon)
+# ---------------------------------------------------------------------------
+
+env:
+  AWS_REGION:  ${{ vars.AWS_REGION  || 'us-east-1' }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER || 'myntist-beacon' }}
+
+jobs:
+  # ── 1. Test ──────────────────────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  # ── 2. Build, push, deploy ───────────────────────────────────────────────
+  deploy:
+    name: Build → Push → Deploy
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      id-token: write   # required for OIDC auth (Option A)
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── AWS credentials ────────────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Image tag: short SHA ───────────────────────────────────────────
+      - name: Set image tag
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::8}"
+          echo "tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "registry=${{ steps.login-ecr.outputs.registry }}" >> "$GITHUB_OUTPUT"
+
+      # ── Push secrets to SSM (idempotent) ──────────────────────────────
+      - name: Sync secrets to SSM Parameter Store
+        run: |
+          put_param() {
+            local name="$1" value="$2"
+            if [ -n "$value" ]; then
+              aws ssm put-parameter \
+                --name "/myntist/beacon/$name" \
+                --value "$value" \
+                --type SecureString \
+                --overwrite \
+                --region "$AWS_REGION" \
+                --no-cli-pager
+            fi
+          }
+          put_param "DATABASE_URL"            "${{ secrets.DATABASE_URL }}"
+          put_param "ED25519_PRIVATE_KEY_HEX" "${{ secrets.ED25519_PRIVATE_KEY_HEX }}"
+          put_param "GODADDY_API_KEY"         "${{ secrets.GODADDY_API_KEY }}"
+          put_param "GODADDY_API_SECRET"      "${{ secrets.GODADDY_API_SECRET }}"
+
+      # ── Build and push: FastAPI backend ───────────────────────────────
+      - name: Build and push API image
+        env:
+          IMAGE: ${{ steps.meta.outputs.registry }}/myntist-beacon-api
+          TAG:   ${{ steps.meta.outputs.tag }}
+        run: |
+          docker build \
+            --file Dockerfile.api \
+            --tag  "$IMAGE:$TAG" \
+            --tag  "$IMAGE:latest" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            .
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"
+          echo "API_IMAGE=$IMAGE:$TAG" >> "$GITHUB_ENV"
+
+      # ── Build and push: React dashboard (production) ──────────────────
+      # Builds a minimal nginx image: `npm run build` → copy dist → nginx.
+      # The inline Dockerfile avoids the `npm run dev` in dashboard/Dockerfile
+      # which is not suitable for a container image served in production.
+      - name: Build and push Dashboard image
+        env:
+          IMAGE: ${{ steps.meta.outputs.registry }}/myntist-beacon-dashboard
+          TAG:   ${{ steps.meta.outputs.tag }}
+        run: |
+          docker build \
+            --tag  "$IMAGE:$TAG" \
+            --tag  "$IMAGE:latest" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --file - \
+            dashboard/ <<'DOCKERFILE'
+          FROM node:20-slim AS builder
+          WORKDIR /app
+          COPY package.json ./
+          RUN npm install --prefer-offline
+          COPY . .
+          ENV NODE_ENV=production
+          RUN npm run build
+
+          FROM nginx:1.25-alpine
+          COPY --from=builder /app/dist /usr/share/nginx/html
+          HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+            CMD wget -qO- http://localhost:80/ || exit 1
+          EXPOSE 80
+          CMD ["nginx", "-g", "daemon off;"]
+          DOCKERFILE
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"
+          echo "DASHBOARD_IMAGE=$IMAGE:$TAG" >> "$GITHUB_ENV"
+
+      # ── Deploy: update ECS task definitions ───────────────────────────
+      # Registers a new task definition revision with the new image tag,
+      # then updates the ECS service to use it. ECS performs a rolling
+      # replacement: new tasks start before old ones are drained.
+
+      - name: Deploy API — register task definition and update service
+        run: |
+          # Fetch the current (active) task definition and strip read-only fields
+          CURRENT=$(aws ecs describe-task-definition \
+            --task-definition myntist-beacon-api \
+            --region "$AWS_REGION" \
+            --query 'taskDefinition' \
+            --output json)
+
+          NEW_DEF=$(echo "$CURRENT" | jq \
+            --arg image "$API_IMAGE" \
+            '.containerDefinitions[0].image = $image
+             | del(.taskDefinitionArn, .revision, .status,
+                   .requiresAttributes, .placementConstraints,
+                   .compatibilities, .registeredAt, .registeredBy)')
+
+          NEW_ARN=$(aws ecs register-task-definition \
+            --region "$AWS_REGION" \
+            --cli-input-json "$NEW_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "Registered task definition: $NEW_ARN"
+
+          aws ecs update-service \
+            --cluster  "$ECS_CLUSTER" \
+            --service  myntist-beacon-api \
+            --task-definition "$NEW_ARN" \
+            --region   "$AWS_REGION" \
+            --no-cli-pager
+
+      - name: Deploy Dashboard — register task definition and update service
+        run: |
+          CURRENT=$(aws ecs describe-task-definition \
+            --task-definition myntist-beacon-dashboard \
+            --region "$AWS_REGION" \
+            --query 'taskDefinition' \
+            --output json)
+
+          NEW_DEF=$(echo "$CURRENT" | jq \
+            --arg image "$DASHBOARD_IMAGE" \
+            '.containerDefinitions[0].image = $image
+             | del(.taskDefinitionArn, .revision, .status,
+                   .requiresAttributes, .placementConstraints,
+                   .compatibilities, .registeredAt, .registeredBy)')
+
+          NEW_ARN=$(aws ecs register-task-definition \
+            --region "$AWS_REGION" \
+            --cli-input-json "$NEW_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "Registered task definition: $NEW_ARN"
+
+          aws ecs update-service \
+            --cluster  "$ECS_CLUSTER" \
+            --service  myntist-beacon-dashboard \
+            --task-definition "$NEW_ARN" \
+            --region   "$AWS_REGION" \
+            --no-cli-pager
+
+      # ── Wait for rollout to complete ──────────────────────────────────
+      # `services-stable` polls every 15 s, times out after 40 checks (10 min).
+      - name: Wait for services to stabilise
+        run: |
+          echo "Waiting for myntist-beacon-api..."
+          aws ecs wait services-stable \
+            --cluster  "$ECS_CLUSTER" \
+            --services myntist-beacon-api \
+            --region   "$AWS_REGION"
+
+          echo "Waiting for myntist-beacon-dashboard..."
+          aws ecs wait services-stable \
+            --cluster  "$ECS_CLUSTER" \
+            --services myntist-beacon-dashboard \
+            --region   "$AWS_REGION"
+
+          echo "Rollout complete."
+
+      # ── Smoke test ────────────────────────────────────────────────────
+      - name: Smoke test — health check
+        run: |
+          ALB=$(aws cloudformation describe-stacks \
+            --stack-name myntist-beacon \
+            --region "$AWS_REGION" \
+            --query 'Stacks[0].Outputs[?OutputKey==`AlbDnsName`].OutputValue' \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$ALB" ]; then
+            echo "Checking https://$ALB/health ..."
+            curl --silent --fail --max-time 10 "https://$ALB/health" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print('status:', d.get('status')); sys.exit(0 if d.get('status')=='ok' else 1)"
+          else
+            echo "ALB DNS not found in stack outputs — skipping HTTP smoke test"
+          fi
+
+      # ── Audit entry ───────────────────────────────────────────────────
+      - name: Write audit entry
+        run: python scripts/write_audit_entry.py
+        env:
+          DEPLOY_ENV:  ${{ github.ref_name }}
+          GITHUB_SHA:  ${{ github.sha }}

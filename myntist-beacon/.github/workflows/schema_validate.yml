@@ -1,0 +1,34 @@
+name: Schema Validation
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate substrate bundle schema
+        run: |
+          python -c "
+          import json
+          from iam_substrate.substrate_api.main import validate_bundle
+          from pydantic import BaseModel
+          class Req(BaseModel):
+              bundle: dict
+          result = validate_bundle(Req(bundle={'identity_id':'test','S':0.9,'Q':1.0,'tau':0.9}))
+          assert result['valid'], f'Schema validation failed: {result}'
+          print('Schema validation passed')
+          "
