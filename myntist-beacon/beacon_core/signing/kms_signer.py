@@ -6,8 +6,8 @@ Signs beacon payloads. Priority:
   2. KMS_KEY_ID set (real UUID/ARN) → AWS KMS RSASSA_PSS_SHA_256 (production)
   3. Neither → signature field omitted
 
-HMAC-SHA256 is intentionally NOT used for public beacon signatures.
-HMAC remains valid only for internal webhook authentication headers.
+Public beacon payload signing uses Ed25519 or KMS RSA only.
+Internal webhook authentication is handled separately in webhooks/hmac_handler.py.
 """
 from __future__ import annotations
 
