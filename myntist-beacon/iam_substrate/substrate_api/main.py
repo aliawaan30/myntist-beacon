@@ -17,6 +17,12 @@ Phase 2 endpoints:
   POST /policy/evaluate      → evaluate policies against a field state
   GET  /policy/rules         → full policy definitions (hot-reloaded from YAML) [admin: X-Admin-Key]
   GET  /hsce/ready           → HSCE interface readiness checklist
+
+Field data endpoints (accessible via /api/field/... through ALB):
+  GET  /field/v1/status.json     → live signed survivability status
+  GET  /field/v1/matrix.json     → 7-day rolling telemetry matrix
+  GET  /field/v1/benchmarks.json → operational + financial benchmarks
+  GET  /field/ui/v1/pulse.json   → pulse theme (green/amber/red)
 """
 from __future__ import annotations
 
@@ -28,6 +34,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
@@ -222,6 +229,33 @@ def field_status() -> Dict[str, Any]:
     """Live signed status payload — reads from the telemetry DB."""
     REQUEST_COUNT.labels(method="GET", path="/field/v1/status.json").inc()
     return _status_handler({}, {})
+
+
+@app.get("/field/v1/matrix.json")
+def field_matrix() -> JSONResponse:
+    """7-day rolling telemetry matrix with Phase 2 financial fields."""
+    REQUEST_COUNT.labels(method="GET", path="/field/v1/matrix.json").inc()
+    from beacon_core.lambdas.generate_matrix.handler import handler
+    result = handler({}, None)
+    return JSONResponse(content=result)
+
+
+@app.get("/field/v1/benchmarks.json")
+def field_benchmarks() -> JSONResponse:
+    """Operational and financial benchmarks with Phase 2 schema."""
+    REQUEST_COUNT.labels(method="GET", path="/field/v1/benchmarks.json").inc()
+    from beacon_core.lambdas.generate_benchmarks.handler import handler
+    result = handler({}, None)
+    return JSONResponse(content=result)
+
+
+@app.get("/field/ui/v1/pulse.json")
+def field_pulse() -> JSONResponse:
+    """Pulse theme (green/amber/red) derived from current S and delta_S."""
+    REQUEST_COUNT.labels(method="GET", path="/field/ui/v1/pulse.json").inc()
+    from beacon_core.lambdas.generate_pulse.handler import handler
+    result = handler({}, None)
+    return JSONResponse(content=result)
 
 
 @app.get("/.well-known/field-signing-keys.json")
